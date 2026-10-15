@@ -15,7 +15,8 @@
       # Upstream release assets + their SRI hashes, per Nix system.
       # Each platform package ships a single `vp` binary.
       # https://www.npmjs.com/package/@voidzero-dev/vite-plus-cli-darwin-arm64
-      # (and its -darwin-x64, -linux-x64-gnu, -linux-arm64-gnu siblings)
+      # (and its -linux-x64-gnu, -linux-arm64-gnu siblings; -darwin-x64 is
+      # omitted because nixpkgs dropped x86_64-darwin support in 26.11)
       assets = {
         x86_64-linux = {
           platform = "linux-x64-gnu";
@@ -24,10 +25,6 @@
         aarch64-linux = {
           platform = "linux-arm64-gnu";
           hash = "sha256-C382AUYi3aTm4pGGKurdPgGjmcKefL5Sd1cizNaD8B8=";
-        };
-        x86_64-darwin = {
-          platform = "darwin-x64";
-          hash = "sha256-Kj0P4FdDBpluYUkWWKNdTh8un9epHA1sXwrBNq7nxn0=";
         };
         aarch64-darwin = {
           platform = "darwin-arm64";

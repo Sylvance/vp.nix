@@ -12,7 +12,9 @@ uses.
 
 ## Supported systems
 
-`x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`.
+`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`.
+
+(`x86_64-darwin` is not packaged: nixpkgs dropped support for it in 26.11.)
 
 ## Usage
 
@@ -168,6 +170,5 @@ state it manages lives in your home directory, outside the Nix store.
      https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-<platform>/-/vite-plus-cli-<platform>-<version>.tgz
    ```
 
-   Platforms are `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-x64`, and
-   `darwin-arm64` (also recorded in the `platform` field of each `assets`
-   entry in `flake.nix`).
+   Platforms are `linux-x64-gnu`, `linux-arm64-gnu`, and `darwin-arm64`
+   (recorded in the `platform` field of each `assets` entry in `flake.nix`).
