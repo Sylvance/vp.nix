@@ -117,8 +117,8 @@ binary next to an app:
 
 > Note: since `pkgs.vp` is injected via the overlay, the pinned version and
 > per-system hashes come from this flake — you don't need to manage any hashes
-> in your own repo. Bump vp by updating this flake's version; see
-> [Updating vp](#updating-vp).
+> in your own repo. To build a different release yourself, use `vp.lib.mkVp`;
+> see [Using a different vp version from your flake](#using-a-different-vp-version-from-your-flake).
 
 ### NixOS / Home Manager
 
@@ -139,6 +139,9 @@ Use the overlay, then reference `pkgs.vp`:
 | `packages.<system>.default` | Alias for `packages.<system>.vp` |
 | `apps.<system>.vp` | `nix run`-able app |
 | `overlays.default` | Adds `pkgs.vp` |
+| `lib.mkVp` | Build any vp release from your own flake |
+| `lib.version` | The pinned Vite+ version |
+| `lib.hashes` | The pinned per-system SRI hashes |
 | `devShells.<system>.default` | Shell with `vp` on `$PATH` |
 | `formatter.<system>` | `nixfmt` for `nix fmt` |
 
@@ -158,12 +161,54 @@ dependencies) into `~/.vite-plus` on first use, exactly as it does with the
 official installer. The Nix package only provides the `vp` binary itself; the
 state it manages lives in your home directory, outside the Nix store.
 
-## Updating vp
+## Using a different vp version from your flake
+
+The default `packages` / `apps` / `overlays` outputs always expose the version
+pinned in this repo's `flake.nix` — you don't edit that file. To pin your own
+version, call `vp.lib.mkVp` from your flake with a `version` and the matching
+per-system `hash`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    vp.url = "github:Sylvance/vp.nix";
+  };
+
+  outputs = { nixpkgs, vp, ... }: {
+    packages.aarch64-darwin.default =
+      vp.lib.mkVp {
+        system = "aarch64-darwin";
+        version = "1.1.0";
+        # SRI hash of that version's npm platform tarball:
+        #   nix store prefetch-file --json \
+        #     https://registry.npmjs.org/@voidzero-dev/vite-plus-cli-darwin-arm64/-/vite-plus-cli-darwin-arm64-1.1.0.tgz
+        hash = "sha256-KTzDt6Lk7x0RtIN8zKvkgpY3+fXo0PGueW6HMmP1HXc=";
+      };
+  };
+}
+```
+
+`mkVp` arguments:
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `system` | *(required)* | Nix system to build for (e.g. `x86_64-linux`, `aarch64-darwin`) |
+| `version` | the pinned release | Vite+ release to package |
+| `hash` | the pinned hash for `system` | SRI hash of the npm platform tarball for that version |
+| `pkgs` | `nixpkgs.legacyPackages.${system}` from this flake's input | Package set to build with |
+
+You can also read the pinned values from your flake: `vp.lib.version` (e.g.
+`"1.2.0"`), `vp.lib.hashes`, and `vp.lib.platformSuffix`.
+
+## Updating the pin in this repo
+
+Maintainers of *this* flake bump the default version here:
 
 1. Pick the new tag from the [releases page](https://github.com/voidzero-dev/vite-plus/releases)
    (e.g. `v1.2.0` → version `1.2.0`).
-2. Update `version` in `flake.nix`.
-3. Refresh the per-system SRI hashes:
+2. Update `pinnedVersion` in `flake.nix`.
+3. Refresh the per-system SRI hashes in `pinnedHashes`:
 
    ```bash
    nix store prefetch-file --json \
@@ -171,4 +216,4 @@ state it manages lives in your home directory, outside the Nix store.
    ```
 
    Platforms are `linux-x64-gnu`, `linux-arm64-gnu`, and `darwin-arm64`
-   (recorded in the `platform` field of each `assets` entry in `flake.nix`).
+   (the `platformSuffix` map in `flake.nix`).

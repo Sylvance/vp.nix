@@ -8,38 +8,44 @@
     let
       inherit (nixpkgs) lib;
 
-      # Bump this together with the per-system hashes when releasing a new
-      # pinned version.
-      version = "1.2.0";
+      # Bump this together with `pinnedHashes` when releasing a new pinned
+      # version; see "Updating the pinned version" in the README.
+      pinnedVersion = "1.2.0";
 
-      # Upstream release assets + their SRI hashes, per Nix system.
-      # Each platform package ships a single `vp` binary.
+      # SRI hash of the npm platform tarball for `pinnedVersion`, per Nix
+      # system. Each platform package ships a single `vp` binary — the same
+      # artifact the official installer uses.
       # https://www.npmjs.com/package/@voidzero-dev/vite-plus-cli-darwin-arm64
       # (and its -linux-x64-gnu, -linux-arm64-gnu siblings; -darwin-x64 is
       # omitted because nixpkgs dropped x86_64-darwin support in 26.11)
-      assets = {
-        x86_64-linux = {
-          platform = "linux-x64-gnu";
-          hash = "sha256-fBNrR5AhfC2IF3wg0d1ogv/fQFeosdxTTsQYmJbhljM=";
-        };
-        aarch64-linux = {
-          platform = "linux-arm64-gnu";
-          hash = "sha256-C382AUYi3aTm4pGGKurdPgGjmcKefL5Sd1cizNaD8B8=";
-        };
-        aarch64-darwin = {
-          platform = "darwin-arm64";
-          hash = "sha256-jv+4PTVSnZBPFJkX24dNlUf7FH6GyDkgM07DP4cTko4=";
-        };
+      pinnedHashes = {
+        x86_64-linux = "sha256-fBNrR5AhfC2IF3wg0d1ogv/fQFeosdxTTsQYmJbhljM=";
+        aarch64-linux = "sha256-C382AUYi3aTm4pGGKurdPgGjmcKefL5Sd1cizNaD8B8=";
+        aarch64-darwin = "sha256-jv+4PTVSnZBPFJkX24dNlUf7FH6GyDkgM07DP4cTko4=";
       };
 
-      systems = builtins.attrNames assets;
+      # npm platform-package suffix for each supported Nix system.
+      platformSuffix = {
+        x86_64-linux = "linux-x64-gnu";
+        aarch64-linux = "linux-arm64-gnu";
+        aarch64-darwin = "darwin-arm64";
+      };
 
+      systems = builtins.attrNames pinnedHashes;
+
+      # Build the `vp` derivation for one system. Defaults to the pinned
+      # release above; override `version`/`hash` to package a different
+      # release from your own flake (see "vp.lib.mkVp" in the README).
       mkVp =
-        system:
+        {
+          system,
+          pkgs ? nixpkgs.legacyPackages.${system},
+          version ? pinnedVersion,
+          hash ? pinnedHashes.${system} or (throw "vp.lib.mkVp: no pinned hash for system ${system}; pass `hash`"),
+        }:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-          asset = assets.${system};
-          cliPackage = "vite-plus-cli-${asset.platform}";
+          cliPackage =
+            "vite-plus-cli-${platformSuffix.${system} or (throw "vp.lib.mkVp: no npm platform suffix for system ${system}")}";
         in
         pkgs.stdenv.mkDerivation {
           pname = "vp";
@@ -47,7 +53,7 @@
 
           src = pkgs.fetchurl {
             url = "https://registry.npmjs.org/@voidzero-dev/${cliPackage}/-/${cliPackage}-${version}.tgz";
-            inherit (asset) hash;
+            inherit hash;
           };
 
           # The Linux builds are dynamically linked against glibc and need their
@@ -79,11 +85,11 @@
             changelog = "https://github.com/voidzero-dev/vite-plus/releases/tag/v${version}";
             license = lib.licenses.mit;
             mainProgram = "vp";
-            platforms = systems;
+            platforms = lib.unique (systems ++ [ system ]);
           };
         };
 
-      vpPackages = lib.genAttrs systems (system: mkVp system);
+      vpPackages = lib.genAttrs systems (system: mkVp { inherit system; });
     in
     {
       # `vp.packages.${system}.vp` is the primary entry point when this
@@ -119,5 +125,14 @@
       });
 
       formatter = lib.genAttrs systems (system: nixpkgs.legacyPackages.${system}.nixfmt);
+
+      # Consumer-facing helpers: inspect the pinned release, or build any
+      # release from your own flake with `mkVp`.
+      lib = {
+        mkVp = mkVp;
+        version = pinnedVersion;
+        hashes = pinnedHashes;
+        inherit platformSuffix;
+      };
     };
 }
