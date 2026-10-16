@@ -137,17 +137,19 @@
 
       vpPackages = lib.genAttrs systems (system: mkVp { inherit system; });
 
-      # Prefetch a project's dependencies (and the Vite+ home state) into a
-      # fixed-output derivation, so that `nix build` can install and build the
-      # project without network access.
+      # Prefetch a project's dependencies into a content-addressed pnpm store
+      # using nixpkgs' standard `fetchPnpmDeps`, laid out as a ready-to-use
+      # Vite+ home directory.
       #
-      # The output is a ready-to-use Vite+ home directory: point `HOME` at a
-      # writable copy of it and `vp install --offline` reconstructs
-      # `node_modules` from the store inside it. `buildVpProject` does this for
-      # you.
+      # The heavy lifting (resolving the lockfile, downloading and normalising
+      # the store) is delegated to `fetchPnpmDeps`, so this no longer depends on
+      # vp's own install logic. `buildVpProject` points `HOME` at a writable
+      # copy of the output and materialises `node_modules` from the store with
+      # a plain, offline `pnpm install`.
       #
       # `src` must contain a committed lockfile (`pnpm-lock.yaml`), and `hash`
-      # is the output hash printed by Nix the first time you build it.
+      # is the output hash of the *pnpm store* printed by Nix the first time you
+      # build it (the same hash-mismatch workflow as `fetchPnpmDeps`).
       fetchVpDeps =
         {
           pname,
@@ -155,145 +157,72 @@
           src,
           hash,
           version ? pinnedVersion,
-          vp ? self.packages.${pkgs.stdenv.hostPlatform.system}.vp,
-          node ? pkgs.nodejs,
           pnpm ? pkgs.pnpm,
-          # `--ignore-scripts` skips lifecycle scripts (including the project's
-          # dev-only `prepare`/`vp config` hook setup and dependency build
-          # scripts, which pnpm does not approve by default). Projects that
-          # need postinstall steps can override this and add the build inputs
-          # they require via `nativeBuildInputs`.
-          installFlags ? [
-            "--frozen-lockfile"
-            "--ignore-scripts"
-          ],
+          # nixpkgs' pnpm fetcher version; 4 (SQL-dump store index) is the one
+          # supported by pnpm 11+, which is what Vite+ projects use.
+          fetcherVersion ? 4,
           nativeBuildInputs ? [ ],
         }:
+        let
+          pnpmDeps = pkgs.fetchPnpmDeps {
+            inherit
+              pname
+              src
+              pnpm
+              fetcherVersion
+              hash
+              ;
+            nativeBuildInputs = nativeBuildInputs;
+          };
+
+          # pnpm appends its store version directory (e.g. `v11`) below this
+          # base. The base is relative to `HOME`, so it stays correct when a
+          # consumer copies the home to a different path.
+          storeBase =
+            if pkgs.stdenv.hostPlatform.isDarwin then "Library/pnpm/store" else ".local/share/pnpm/store";
+        in
         pkgs.runCommand "vp-deps-${pname}-${version}"
           {
-            inherit
-              src
-              vp
-              node
-              pnpm
-              ;
-            # Plain strings (no store-path context) are fine to pass through
-            # the environment; store paths themselves must be passed as
-            # attributes (above), never interpolated into the builder, or Nix
-            # rejects the fixed-output derivation.
+            # Store paths must be passed as derivation attributes, never
+            # interpolated into the builder, or Nix rejects the derivation.
+            pnpmDeps = pnpmDeps;
+            # Plain strings are fine as environment variables.
             config = systemFirstConfig;
-            installFlags = lib.escapeShellArgs installFlags;
+            inherit storeBase;
 
             nativeBuildInputs = [
-              pkgs.jq
-              pkgs.git
+              pkgs.sqlite
+              pkgs.zstd
             ]
             ++ nativeBuildInputs;
-
-            # Fixed-output derivation: network is allowed while building this,
-            # but the result is content-addressed so consumers stay hermetic.
-            outputHashMode = "recursive";
-            outputHash = hash;
-
             dontUnpack = true;
           }
           ''
-            mkdir -p "$out/.config/vite-plus"
-            printf '%s\n' "$config" > "$out/.config/vite-plus/config.json"
-
             export HOME="$out"
-            export CI=true
-            export VP_NO_UPDATE_CHECK=1
-            # The `prepare` lifecycle script (`vp config`) installs a git hook
-            # dispatcher; skip it — hooks are a dev-time concern and would need
-            # a git repository in the sandbox.
-            export VP_GIT_HOOKS=0
-            export PATH="$node/bin:$pnpm/bin:$PATH"
+            mkdir -p "$HOME/.config/vite-plus" "$HOME/$storeBase"
+            printf '%s\n' "$config" > "$HOME/.config/vite-plus/config.json"
 
-            cp -R "$src/." ./project
-            chmod -R u+w ./project
-            (
-              cd ./project
-              "$vp/bin/vp" install $installFlags
-            )
-            # Ship the installed dependency tree with the store seed.
-            # Consumers restore it verbatim: pnpm's supply-chain lockfile
-            # verification runs on every `vp install` and needs registry
-            # access, so reinstalling offline is not possible today.
-            rm -rf "$out/node_modules"
-            cp -R ./project/node_modules "$out/node_modules"
-            # pnpm records absolute paths (home, store dir) in its
-            # `node_modules` bookkeeping. A fixed-output derivation's output
-            # must not reference store paths at all — not even its own output
-            # path — so scrub any that leaked in.
-            rm -f "$out/node_modules/.modules.yaml"
-            # Note: `set -o pipefail` is active in the stdenv builder, so a
-            # `grep | while` pipeline would abort the build when nothing
-            # matches. Iterate over a substitution instead.
-            for f in $(grep -rIl -- "$out" "$out/node_modules" 2>/dev/null || true); do
-              sed -i.bak "s|$out|/vp-nix-home|g" "$f"
-              rm -f "$f.bak"
-            done
-            rm -rf ./project
+            # Unpack the reproducible store tarball into pnpm's default store
+            # location for this HOME, then rebuild its SQLite index from the
+            # text dump the fetcher produced (the binary database is not
+            # reproducible across builds).
+            tar --zstd -xf "$pnpmDeps/pnpm-store.tar.zst" -C "$HOME/$storeBase"
+            chmod -R u+w "$HOME/$storeBase"
+            storeDir="$(echo "$HOME/$storeBase"/v*)"
+            if [ -f "$storeDir/index.db.sql" ]; then
+              sqlite3 "$storeDir/index.db" < "$storeDir/index.db.sql"
+              rm -f "$storeDir/index.db.sql"
+            fi
 
-            # Keep only the state needed to reinstall offline: the lockfile
-            # config, the pnpm store, and any managed runtime/package manager
-            # that was pinned by the project. Everything else (caches, logs,
-            # shims, update metadata) is either volatile or path-dependent.
-            #
-            # Fixed-output derivations must not reference store paths at all
-            # (not even their own output path), so we must also strip vp's
-            # global self-setup state (which records vp's own store path) and
-            # the shell shims it writes into `.config/vite-plus` (which embed
-            # `$HOME`, i.e. the output path itself).
-            find "$out" -mindepth 1 -maxdepth 1 ! -name .config ! -name .local ! -name Library ! -name node_modules -exec rm -rf {} +
-            rm -rf "$out/.local/state"
-            find "$out/.config/vite-plus" -mindepth 1 ! -name config.json -delete
-            if [ -d "$out/.local/share" ]; then
-              find "$out/.local/share" -mindepth 1 -maxdepth 1 ! -name pnpm ! -name vite-plus -exec rm -rf {} +
-            fi
-            if [ -d "$out/.local/share/vite-plus" ]; then
-              find "$out/.local/share/vite-plus" -mindepth 1 -maxdepth 1 ! -name package_manager ! -name js_runtime -exec rm -rf {} +
-            fi
-            if [ -d "$out/Library" ]; then
-              find "$out/Library" -mindepth 1 -maxdepth 1 ! -name pnpm ! -name Caches -exec rm -rf {} +
-            fi
-            # pnpm's registry metadata cache is required by the offline
-            # supply-chain lockfile verification that runs during
-            # `vp install --offline`. It records only registry-supplied
-            # `etag`/`modified` values, so it is deterministic for a given
-            # lockfile. The verification result file, however, contains a
-            # timestamp and must go.
-            if [ -d "$out/Library/Caches" ]; then
-              find "$out/Library/Caches" -mindepth 1 -maxdepth 1 ! -name pnpm -exec rm -rf {} +
-            fi
-            if [ -d "$out/Library/Caches/pnpm" ]; then
-              find "$out/Library/Caches/pnpm" -mindepth 1 -maxdepth 1 ! -name 'v*' -exec rm -rf {} +
-              for d in "$out"/Library/Caches/pnpm/v*; do
-                [ -d "$d" ] && find "$d" -mindepth 1 -maxdepth 1 ! -name metadata ! -name metadata-full -exec rm -rf {} +
-              done
-              find "$out/Library/Caches/pnpm" -name 'lockfile-verified.jsonl' -delete
-            fi
-            rm -rf "$out"/Library/pnpm/store/*/projects "$out"/.local/share/pnpm/store/*/projects 2>/dev/null || true
+            # Keep only the packaged files and the index; pnpm recreates the
+            # rest on demand.
+            rm -rf "$storeDir"/tmp
             find "$out" -name '*.lock' -delete
-            find "$out" -name 'index_cache.json' -delete
-
-            # pnpm's store index records a per-file `checkedAt` timestamp, which
-            # would change the fixed-output hash on every build. Normalise it.
-            normalize_index() {
-              for f in "$@"; do
-                jq -c 'walk(if type == "object" and has("checkedAt") then .checkedAt = 0 else . end)' "$f" > "$f.tmp"
-                mv "$f.tmp" "$f"
-              done
-            }
-            normalize_index $(find "$out" -path '*/store/*/index/*.json')
           '';
 
-      # Build a Vite+ project hermetically: seed a writable Vite+ home and
-      # dependency tree from `vpDeps`, run `vp build` offline, and install
-      # the result. No install step is run here — pnpm's supply-chain
-      # lockfile verification requires registry access, so `fetchVpDeps`
-      # captures `node_modules` instead.
+      # Build a Vite+ project hermetically: restore the Vite+ home (and its
+      # pnpm store) from `vpDeps`, materialise `node_modules` from that store
+      # with an offline `pnpm install`, run the build, and install the result.
       buildVpProject =
         {
           pname,
@@ -305,6 +234,11 @@
           node ? pkgs.nodejs,
           pnpm ? pkgs.pnpm,
           buildScript ? "vp build",
+          # Extra `pnpm install` flags. Lifecycle scripts are always skipped
+          # (`--ignore-scripts`); projects that need postinstall steps should
+          # add the toolchain they require via `nativeBuildInputs`.
+          pnpmInstallFlags ? [ ],
+          pnpmWorkspaces ? [ ],
           installPhase ? ''
             runHook preInstall
             mkdir -p $out
@@ -334,14 +268,30 @@
               export HOME=$PWD/.vp-home
               cp -R ${vpDeps} $HOME
               chmod -R u+w $HOME
-              rm -rf $HOME/node_modules
 
               export CI=true
               export VP_NO_UPDATE_CHECK=1
               export VP_GIT_HOOKS=0
 
-              cp -R ${vpDeps}/node_modules ./node_modules
-              chmod -R u+w ./node_modules
+              # Materialise `node_modules` from the store captured by
+              # `fetchVpDeps`. pnpm's registry supply-chain verification needs
+              # network access, so opt out for this offline install (the fetch
+              # already performed the check online). `clone-or-copy` keeps the
+              # install working on filesystems without hard-link support. The
+              # overrides are scoped to the install so the build itself runs
+              # with a clean pnpm environment.
+              pnpm_config_pm_on_fail=ignore \
+              pnpm_config_trust_lockfile=true \
+              pnpm_config_package_import_method=clone-or-copy \
+              pnpm_config_side_effects_cache=false \
+              pnpm_config_update_notifier=false \
+              pnpm_config_reporter=append-only \
+                pnpm install \
+                  --offline \
+                  --ignore-scripts \
+                  --frozen-lockfile \
+                  ${lib.escapeShellArgs (pnpmInstallFlags ++ map (w: "--filter=${w}") pnpmWorkspaces)}
+
               ${buildScript}
 
               runHook postBuild

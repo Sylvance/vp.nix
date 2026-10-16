@@ -140,7 +140,7 @@ Use the overlay, then reference `pkgs.vp`:
 | `apps.<system>.vp` | `nix run`-able app |
 | `overlays.default` | Adds `pkgs.vp` |
 | `lib.mkVp` | Build any vp release from your own flake |
-| `lib.fetchVpDeps` | Fixed-output derivation capturing a project's dependencies |
+| `lib.fetchVpDeps` | Fixed-output derivation capturing a project's pnpm store as a Vite+ home |
 | `lib.buildVpProject` | Build a Vite+ project offline from a `fetchVpDeps` result |
 | `lib.version` | The pinned Vite+ version |
 | `lib.hashes` | The pinned per-system SRI hashes |
@@ -175,13 +175,14 @@ the argument table below.
 `lib.fetchVpDeps` and `lib.buildVpProject` let you build a Vite+ project with
 Nix without network access or a writable home:
 
-- **`fetchVpDeps`** is a fixed-output derivation. It seeds a scratch Vite+
-  home with a `system_first` configuration (so vp reuses the Node.js and pnpm
-  you pass it instead of downloading its own), runs `vp install` once with
-  network access, and captures the resulting pnpm store, registry metadata,
-  and `node_modules` tree. Its output hash pins the whole dependency closure.
-- **`buildVpProject`** restores that home and `node_modules` into the build
-  sandbox, then runs `vp build` — fully offline.
+- **`fetchVpDeps`** resolves the lockfile with nixpkgs' standard
+  `fetchPnpmDeps` (fixed-output, so its hash pins the whole dependency
+  closure) and lays the resulting pnpm store out as a ready-to-use Vite+ home
+  with a `system_first` configuration. It does not run `vp install` and does
+  not capture `node_modules`.
+- **`buildVpProject`** copies that home into the sandbox and materialises
+  `node_modules` from the store with an offline `pnpm install` (workspaces
+  included), then runs `vp build` — fully offline.
 
 ```nix
 {
@@ -213,27 +214,34 @@ Nix without network access or a writable home:
 
 ### Updating the hash
 
-Put a placeholder (`sha256-AAAA…=`), run `nix build`, and copy the `got:`
-value from the mismatch error:
+`fetchVpDeps` is fixed-output: `hash` is the hash of the **pnpm store**
+produced by `fetchPnpmDeps`, not of `node_modules`. Put a placeholder
+(`sha256-AAAA…=`), run `nix build`, and copy the `got:` value from the
+mismatch error:
 
 ```console
 $ nix build
-error: hash mismatch in fixed-output derivation '/nix/store/…-vp-deps-my-app-1.2.0.drv':
+error: hash mismatch in fixed-output derivation '/nix/store/…-pnpm-deps-my-app.drv':
     specified: sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
        got:    sha256-EXq2goYjfQed+qt2Gj40krazYTattfPFHc1I6rrghQ0=
 ```
 
 Update the hash whenever the lockfile or the project's dependencies change.
 
-### Why `node_modules` is captured
+### Why the install happens at build time
 
-`vp install` verifies the lockfile against the npm registry (supply-chain
-policies: release age, integrity, tarball bindings) on every invocation. That
-check needs network access, so reinstalling dependencies from the seeded
-pnpm store while offline is not possible today — pnpm fails with
-`ERR_PNPM_NO_OFFLINE_META`. `fetchVpDeps` therefore captures the installed
-`node_modules` tree, and `buildVpProject` restores it verbatim instead of
-running an install.
+pnpm verifies the lockfile against the npm registry (supply-chain policies:
+release age, integrity, tarball bindings) on every invocation. That check
+needs network access, so it is performed once, by `fetchPnpmDeps`, while
+fetching. `buildVpProject` then runs its install with
+`pnpm_config_trust_lockfile=true`, which skips the online re-check and lets a
+seeded store install offline. (Without it pnpm fails with
+`ERR_PNPM_NO_OFFLINE_META`.)
+
+`buildVpProject` runs the install itself, rather than shipping a captured
+`node_modules` tree, so that workspace links are recreated correctly. A copied
+root `node_modules` does not include the per-package `node_modules` of
+workspace members, which breaks monorepo builds.
 
 ### Arguments
 
@@ -244,12 +252,11 @@ running an install.
 | `pname` | *(required)* | Project name; output is named `vp-deps-<pname>-<version>` |
 | `pkgs` | *(required)* | Package set to build with |
 | `src` | *(required)* | Project source, including the lockfile |
-| `hash` | *(required)* | SRI hash of the dependency closure |
+| `hash` | *(required)* | SRI hash of the pnpm store |
 | `version` | the pinned Vite+ version | Version suffix for the output name |
-| `vp` | `packages.<system>.vp` | vp used to run the install |
-| `node` / `pnpm` | `pkgs.nodejs` / `pkgs.pnpm` | Toolchain placed on `PATH` |
-| `installFlags` | `[ "--frozen-lockfile" "--ignore-scripts" ]` | Flags for the captured install |
-| `nativeBuildInputs` | `[ ]` | Extra build inputs (e.g. compilers for packages with build scripts) |
+| `pnpm` | `pkgs.pnpm` | pnpm used to fetch the store (must be ≥ 11 for `fetcherVersion = 4`) |
+| `fetcherVersion` | `4` | nixpkgs `fetchPnpmDeps` fetcher version |
+| `nativeBuildInputs` | `[ ]` | Extra inputs for the fetch |
 
 `buildVpProject { pname, pkgs, src, vpDeps, … }`:
 
@@ -260,24 +267,28 @@ running an install.
 | `version` | `"0.0.0"` | Output version |
 | `vp` / `node` / `pnpm` | as in `fetchVpDeps` | Toolchain used for the build |
 | `buildScript` | `"vp build"` | Command run in the project directory |
+| `pnpmInstallFlags` | `[ ]` | Extra flags for the offline install |
+| `pnpmWorkspaces` | `[ ]` | Workspaces to `--filter` during the install |
 | `installPhase` | copies `dist/` into `$out` | Custom install phase |
 | `env` / `nativeBuildInputs` | `{ }` / `[ ]` | Extra environment and inputs |
 
 ### Caveats
 
-- **Hash churn.** The FOD captures pnpm's registry metadata cache (required
-  by the offline lockfile verification), whose entries include npm's
-  `etag`/`modified` values. When those change for any locked package the hash
-  must be updated, even if the lockfile itself is unchanged.
-- **Lifecycle scripts.** The default `--ignore-scripts` skips dependency
-  build scripts and the project's own `prepare` script (`vp migrate` sets
-  `prepare` to `vp config`, which needs `git` and installs a git-hook
-  dispatcher; `VP_GIT_HOOKS=0` is already set). If a dependency needs a
-  postinstall step, drop `--ignore-scripts` from `installFlags` and add the
-  toolchain it needs to `nativeBuildInputs`. Note that pnpm 12 refuses
-  `--frozen-lockfile` installs when build scripts are present but unapproved
-  (`ERR_PNPM_IGNORED_BUILDS`); pass `-- --config.strict-dep-builds=false` or
-  `-- --allow-build=<pkg>` through `installFlags` to allow them.
+- **Store size.** `fetchPnpmDeps` runs pnpm with `--force` and
+  `force_ignores_platform`, so the store contains tarballs for *every*
+  platform, not just the one you are building for. Expect the output to be
+  considerably larger than a single-platform `node_modules` (multi-gigabyte
+  for large monorepos).
+- **Lifecycle scripts.** The offline install always passes
+  `--ignore-scripts`, skipping dependency build scripts and the project's own
+  `prepare` script (`vp migrate` sets `prepare` to `vp config`, which needs
+  `git` and installs a git-hook dispatcher; `VP_GIT_HOOKS=0` is already set).
+  If a dependency needs a postinstall step, add the toolchain it needs to
+  `nativeBuildInputs`, or override the install by supplying your own
+  `buildScript`. Note that pnpm 12 refuses `--frozen-lockfile` installs when
+  build scripts are present but unapproved (`ERR_PNPM_IGNORED_BUILDS`); pass
+  `-- --config.strict-dep-builds=false` or `-- --allow-build=<pkg>` through
+  `pnpmInstallFlags` to allow them.
 - **Vite+ projects only.** `vp build` refuses a plain Vite project (it
   resolves `vite` to `@voidzero-dev/vite-plus-core`). For non-Vite+ projects
   point `buildScript` at `vpr build` or another command.
